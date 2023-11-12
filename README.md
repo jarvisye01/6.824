@@ -1,2 +1,2 @@
-# datastructure_go
-Implement classic data structure using GO!!!
+# 6.824 Raft
+之前写过一次6.824的Raft，很多地方在coding的时候没有设计好，这里重新实现一次。

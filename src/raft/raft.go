@@ -19,7 +19,10 @@ package raft
 
 import (
 	//	"bytes"
+
+	"encoding/json"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,7 +32,8 @@ import (
 )
 
 const (
-	ZoreTerm         = 0
+	ZeroIndex        = 0
+	ZeroTerm         = 0
 	None             = -1
 	Follower         = 0
 	Candidater       = 1
@@ -60,6 +64,33 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+func getMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func getMax(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func getEntries(entries []*Entry) string {
+	d, _ := json.Marshal(entries)
+	return string(d)
+}
+
+// Entry for raft log
+type Entry struct {
+	Command   interface{}
+	Index     int
+	Term      int
+	Committed bool
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -77,6 +108,11 @@ type Raft struct {
 	voteFor  int  // Vote for which peer in this term
 
 	lastHeartBeatTime time.Time // Last receive heart beat time
+
+	applyCh       chan ApplyMsg
+	entries       []*Entry // Raft logs
+	commitedIndex int      // Leader's commited log index
+	nextIndex     []int    // Next index for followers
 }
 
 // getMajorityCount
@@ -114,6 +150,90 @@ func (rf *Raft) modifyPeerInfo(t int, l bool, s, v int) {
 		return
 	}
 	rf.term, rf.isLeader, rf.state, rf.voteFor = t, l, s, v
+}
+
+func (rf *Raft) getEntryInfo(idx int) (int, int) {
+	if idx == ZeroIndex {
+		return ZeroIndex, ZeroTerm
+	}
+	e := rf.entries[idx-1]
+	return e.Index, e.Term
+}
+
+func getEntryInfoAux(entries []*Entry, idx int) (int, int) {
+	if idx == ZeroIndex {
+		return ZeroIndex, ZeroTerm
+	}
+	e := entries[idx-1]
+	return e.Index, e.Term
+}
+
+func (rf *Raft) getLastEntryInfo() (int, int) {
+	return rf.getEntryInfo(len(rf.entries))
+}
+
+// heartBeatTimeout
+func (rf *Raft) heartBeatTimeout() bool {
+	return time.Since(rf.lastHeartBeatTime)/time.Millisecond > HeartBeatTimeout
+}
+
+// couldVote for request peer
+func (rf *Raft) couldVote(req *RequestVoteArgs) bool {
+	lastLogInex, lastLogTerm := rf.getLastEntryInfo()
+	if (req.Term > rf.term || (req.Term == rf.term && rf.voteFor == None)) &&
+		((req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogInex) || req.LastLogTerm > lastLogTerm) {
+		return true
+	}
+	return false
+}
+
+// matchLog
+func (rf *Raft) matchLog(index, term int) bool {
+	if index > len(rf.entries) {
+		return false
+	}
+	i, t := rf.getEntryInfo(index)
+	return i == index && t == term
+}
+
+// mergeLog
+func (rf *Raft) mergeLog(prevLogIndex int, entries []*Entry) {
+	i, j := 0, prevLogIndex
+	for j < len(rf.entries) && i < len(entries) {
+		if !rf.matchLog(entries[i].Index, entries[i].Term) {
+			break
+		}
+		i++
+		j++
+	}
+	// truncate and break
+	rf.entries = rf.entries[:j]
+	for ; i < len(entries); i++ {
+		entries[i].Committed = false
+		rf.entries = append(rf.entries, entries[i])
+	}
+}
+
+// getSendAppendEntryInfo
+func (rf *Raft) getSendAppendEntryInfo(nextIndex int, entries []*Entry) (int, int, []*Entry) {
+	idx, term := getEntryInfoAux(entries, nextIndex-1)
+	logs := make([]*Entry, 0)
+	if nextIndex > ZeroIndex {
+		logs = entries[nextIndex-1:]
+	}
+	return idx, term, logs
+}
+
+// HeartBeatTimeout
+func (rf *Raft) HeartBeatTimeout() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.heartBeatTimeout()
+}
+
+func (rf *Raft) getMajorityIndex(nextIndex []int) int {
+	sort.Ints(nextIndex)
+	return nextIndex[len(nextIndex)-rf.getMajorityCount()] - 1
 }
 
 // return currentTerm and whether this server
@@ -175,18 +295,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// heartBeatTimeout
-func (rf *Raft) heartBeatTimeout() bool {
-	return time.Since(rf.lastHeartBeatTime)/time.Millisecond > HeartBeatTimeout
-}
-
-// HeartBeatTimeout
-func (rf *Raft) HeartBeatTimeout() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.heartBeatTimeout()
-}
-
 // Start a leader election if need
 func (rf *Raft) startLeaderElection() {
 	rf.mu.Lock()
@@ -198,6 +306,7 @@ func (rf *Raft) startLeaderElection() {
 	rf.modifyPeerInfo(term+1, LeaderFalse, Candidater, rf.me)
 	term, isLeader, state, voteFor = rf.getPeerInfo()
 	_, _ = isLeader, voteFor // make compiler happy
+	lastLogInex, lastLogTerm := rf.getLastEntryInfo()
 	rf.mu.Unlock()
 
 	// make a leader election
@@ -211,7 +320,9 @@ func (rf *Raft) startLeaderElection() {
 		}
 		go func(peer int) {
 			req := RequestVoteArgs{
-				PeerInfo{Peer: rf.me, Term: term},
+				PeerInfo:     PeerInfo{Peer: rf.me, Term: term},
+				LastLogIndex: lastLogInex,
+				LastLogTerm:  lastLogTerm,
 			}
 			rsp := RequestVoteReply{}
 			Debugf(dLog, "S%d send request vote to S%d req %v",
@@ -243,11 +354,16 @@ func (rf *Raft) startLeaderElection() {
 		rf.modifyPeerInfo(rf.term, LeaderTrue, Leader, rf.me)
 		Debugf(dLeader, "S%d become leader Term %d VoteCount %d",
 			rf.me, rf.term, voteCount)
+		idx, _ := rf.getLastEntryInfo()
+		for i := 0; i < len(rf.nextIndex); i++ {
+			rf.nextIndex[i] = idx + 1
+		}
 	} else {
 		rf.modifyPeerInfo(rf.term, LeaderFalse, Follower, rf.voteFor)
 		Debugf(dLeader, "S%d not become leader Term %d VoteCount %d",
 			rf.me, rf.term, voteCount)
 	}
+	rf.updateHeartBeatTime()
 }
 
 func (rf *Raft) leaderSendAppendEntry() {
@@ -258,19 +374,35 @@ func (rf *Raft) leaderSendAppendEntry() {
 		rf.mu.Unlock()
 		return
 	}
+	entries := make([]*Entry, 0)
+	entries = append(entries, rf.entries...)
+	nextIndex := make([]int, 0)
+	nextIndex = append(nextIndex, rf.nextIndex...)
+	lastLogIndex, _ := rf.getLastEntryInfo()
+	nextIndex[rf.me] = lastLogIndex + 1
+	committedIndex := rf.commitedIndex
 	rf.mu.Unlock()
 
 	// start send append entry to peers
 	cond := sync.NewCond(&rf.mu)
-	rpcFailed := 0        // guard by cond.L
-	heartBeatOKCount := 1 // guard by cond.L
-	finished := 1         // guard by cond.L
+	rpcFailed := 0          // guard by cond.L
+	heartBeatOKCount := 1   // guard by cond.L
+	appendEntryOKCount := 1 // guard by cond.L
+	finished := 1           // guard by cond.L
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		go func(peer int) {
-			req := AppendEntryRequest{PeerInfo{Peer: rf.me, Term: term}}
+			nIdx := nextIndex[peer]
+			prevLogIndex, prevLogTerm, logs := rf.getSendAppendEntryInfo(nIdx, entries)
+			req := AppendEntryRequest{
+				PeerInfo:      PeerInfo{Peer: rf.me, Term: term},
+				PrevLogIndex:  prevLogIndex,
+				PrevLogTerm:   prevLogTerm,
+				Entries:       logs,
+				CommitedIndex: committedIndex,
+			}
 			rsp := AppendEntryResponse{}
 			Debugf(dLog, "S%d send append entry to S%d req %v",
 				rf.me, peer, req)
@@ -288,6 +420,14 @@ func (rf *Raft) leaderSendAppendEntry() {
 			}
 			if term == rsp.Term {
 				heartBeatOKCount++
+				if rsp.Succ {
+					appendEntryOKCount++
+					nextIndex[peer] = prevLogIndex + len(req.Entries) + 1
+					rf.nextIndex[peer] = prevLogIndex + len(req.Entries) + 1
+				} else {
+					nextIndex[peer] = ZeroIndex + 1
+					rf.nextIndex[peer] = ZeroIndex + 1
+				}
 			}
 			cond.Broadcast()
 		}(peer)
@@ -300,6 +440,28 @@ func (rf *Raft) leaderSendAppendEntry() {
 	if heartBeatOKCount >= rf.getMajorityCount() {
 		Debugf(dTimer, "S%d send append entry succ", rf.me)
 		rf.updateHeartBeatTime()
+	}
+	if term == rf.term && appendEntryOKCount >= rf.getMajorityCount() {
+		tmpIndex := make([]int, len(nextIndex))
+		copy(tmpIndex, nextIndex)
+		newCommitedIndex := rf.getMajorityIndex(tmpIndex)
+		_, logTerm := rf.getEntryInfo(newCommitedIndex)
+		Debugf(dCommit, "S%d leader commitIndex %d newCommitedIndex %d",
+			rf.me, rf.commitedIndex, newCommitedIndex)
+		if rf.commitedIndex < newCommitedIndex && logTerm == rf.term {
+			// apply msg
+			for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.entries[i].Command,
+					CommandIndex: rf.entries[i].Index,
+				}
+				rf.entries[i].Committed = true
+				Debugf(dCommit, "S%d leader commit at %d term %d command %v",
+					rf.me, i, rf.term, rf.entries[i].Command)
+			}
+			rf.commitedIndex = newCommitedIndex
+		}
 	}
 	if rf.heartBeatTimeout() {
 		// fail to send heart beat
@@ -324,6 +486,8 @@ func (r *PeerInfo) GetInfo() (int, int) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	PeerInfo
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -339,32 +503,65 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debugf(dLog2, "S%d receive request vote from S%d req %v",
-		rf.me, args.Peer, *args)
-	if args.Term > rf.term || (args.Term == rf.term && rf.voteFor == None) {
+	li, lt := rf.getLastEntryInfo()
+	Debugf(dLog2, "S%d receive request vote from S%d req %v term %d li %d lt %d entries %s",
+		rf.me, args.Peer, *args, rf.term, li, lt, getEntries(rf.entries))
+	if rf.couldVote(args) {
 		Debugf(dVote, "S%d vote for S%d", rf.me, args.Peer)
 		rf.modifyPeerInfo(args.Term, LeaderFalse, Follower, args.Peer)
 		rf.updateHeartBeatTime()
+	} else if args.Term > rf.term {
+		rf.modifyPeerInfo(args.Term, LeaderFalse, Follower, None)
 	}
 	reply.Peer, reply.Term, reply.VoteFor = rf.me, rf.term, rf.voteFor
 }
 
 type AppendEntryRequest struct {
 	PeerInfo
+	PrevLogIndex  int
+	PrevLogTerm   int
+	Entries       []*Entry
+	CommitedIndex int
 }
 
 type AppendEntryResponse struct {
 	PeerInfo
+	Succ bool
 }
 
 func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debugf(dLog2, "S%d receive append entry from S%d req %v",
-		rf.me, req.Peer, *req)
+	Debugf(dLog2, "S%d receive append entry from S%d req %v entries %s",
+		rf.me, req.Peer, *req, getEntries(req.Entries))
 	if req.Term >= rf.term {
 		rf.modifyPeerInfo(req.Term, LeaderFalse, Follower, req.Peer)
 		rf.updateHeartBeatTime()
+		// check log entry
+		Debugf(dLog2, "S%d follower entries %s", rf.me, getEntries(rf.entries))
+		if rf.matchLog(req.PrevLogIndex, req.PrevLogTerm) {
+			// merge log
+			rf.mergeLog(req.PrevLogIndex, req.Entries)
+			li, _ := rf.getLastEntryInfo()
+			newCommitedIndex := getMin(li, req.CommitedIndex)
+			Debugf(dCommit, "S%d follower commitIndex %d newCommitedIndex %d",
+				rf.me, rf.commitedIndex, newCommitedIndex)
+			if rf.commitedIndex < newCommitedIndex {
+				// apply msg
+				for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+					rf.applyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      rf.entries[i].Command,
+						CommandIndex: rf.entries[i].Index,
+					}
+					rf.entries[i].Committed = true
+					Debugf(dCommit, "S%d follower commit at %d term %d command %v",
+						rf.me, i, rf.term, rf.entries[i].Command)
+				}
+				rf.commitedIndex = newCommitedIndex
+			}
+			rsp.Succ = true
+		}
 	}
 	rsp.Peer, rsp.Term = rf.me, rf.term
 }
@@ -419,12 +616,28 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryRequest, reply *App
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
+	isLeader := false
+	currentTerm, leader, _, _ := rf.getPeerInfo()
+	lastLogInex, _ := rf.getLastEntryInfo()
+	if leader {
+		isLeader = leader
+		term = currentTerm
+		index = lastLogInex + 1
+		rf.entries = append(rf.entries, &Entry{
+			Command:   command,
+			Index:     index,
+			Term:      currentTerm,
+			Committed: false,
+		})
+		rf.nextIndex[rf.me] = index + 1
+	}
+	Debugf(dStart, "S%d start command %v index %d term %d isLeader %t",
+		rf.me, command, index, term, isLeader)
 	return index, term, isLeader
 }
 
@@ -459,6 +672,7 @@ func (rf *Raft) ticker() {
 			// check leader election
 			go rf.startLeaderElection()
 		} else if state == Leader {
+			// leader send append entry to followers
 			go rf.leaderSendAppendEntry()
 		}
 
@@ -484,12 +698,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	func() {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.modifyPeerInfo(ZoreTerm, false, Follower, None)
+		rf.modifyPeerInfo(ZeroTerm, false, Follower, None)
 		rf.updateHeartBeatTime()
+		rf.entries = make([]*Entry, 0)
+		rf.commitedIndex = ZeroIndex
+		rf.nextIndex = make([]int, 0)
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex = append(rf.nextIndex, ZeroIndex+1)
+		}
 	}()
 
 	// Your initialization code here (2A, 2B, 2C).

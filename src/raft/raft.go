@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -154,7 +156,10 @@ func (rf *Raft) modifyPeerInfo(t int, l bool, s, v int) {
 			t, rf.term)
 		return
 	}
-	rf.term, rf.isLeader, rf.state, rf.voteFor = t, l, s, v
+	if rf.term != t || rf.isLeader != l || rf.state != s || rf.voteFor != v {
+		rf.term, rf.isLeader, rf.state, rf.voteFor = t, l, s, v
+		rf.persist()
+	}
 }
 
 // getEntryInfo at idx
@@ -174,6 +179,11 @@ func (rf *Raft) getLastEntryInfo() (int, int) {
 // heartBeatTimeout
 func (rf *Raft) heartBeatTimeout() bool {
 	return time.Since(rf.lastHeartBeatTime)/time.Millisecond > HeartBeatTimeout
+}
+
+// candidateTimeout
+func (rf *Raft) candidateTimeout() bool {
+	return time.Since(rf.lastHeartBeatTime)/time.Millisecond > 3*HeartBeatTimeout
 }
 
 // couldVote for request peer
@@ -205,7 +215,7 @@ func (rf *Raft) mergeLog(prevLogIndex int, entries []*Entry) {
 		i++
 		j++
 	}
-	// truncate and break
+	// truncate
 	rf.entries = rf.entries[:j]
 	for ; i < len(entries); i++ {
 		entries[i].Committed = false
@@ -267,12 +277,16 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.state)
+	e.Encode(rf.isLeader)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.entries)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+	Debugf(dInfo, "S%d persist data term %d entries %s", rf.me, rf.term, entriesStr(rf.entries))
 }
 
 // restore previously persisted state.
@@ -282,17 +296,35 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term, state, voteFor int
+	var isLeader bool
+	var entries []*Entry
+	if d.Decode(&term) != nil || d.Decode(&state) != nil || d.Decode(&isLeader) != nil ||
+		d.Decode(&voteFor) != nil || d.Decode(&entries) != nil {
+		Debugf(dError, "S%d readPersist error", rf.me)
+	} else {
+		rf.term, rf.state, rf.isLeader, rf.voteFor = term, state, isLeader, voteFor
+		rf.entries = entries
+		rf.commitedIndex = 0
+		lastIndex := 0
+		for _, e := range rf.entries {
+			if e.Committed {
+				rf.commitedIndex = e.Index
+			}
+			lastIndex = e.Index
+		}
+		rf.nextIndex = make([]int, len(rf.peers))
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				rf.nextIndex[i] = lastIndex + 1
+				continue
+			}
+			rf.nextIndex[i] = ZeroIndex + 1
+		}
+		Debugf(dInfo, "S%d readPersist term %d entries %s", rf.me, rf.term, entriesStr(rf.entries))
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -323,6 +355,7 @@ func (rf *Raft) startLeaderElection() {
 	rpcFailed := 0 // guard by cond.L
 	voteCount := 1 // guard by cond.L
 	finished := 1  // guard by cond.L
+	maxTerm := term
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -346,6 +379,7 @@ func (rf *Raft) startLeaderElection() {
 			if rsp.Term == term && rsp.VoteFor == rf.me {
 				voteCount++
 			}
+			maxTerm = getMax(maxTerm, rsp.Term)
 			cond.Broadcast()
 		}(peer)
 	}
@@ -362,10 +396,10 @@ func (rf *Raft) startLeaderElection() {
 		for i := 0; i < len(rf.nextIndex); i++ {
 			rf.nextIndex[i] = idx + 1
 		}
-	} else {
+	} else if maxTerm >= rf.term {
 		rf.modifyPeerInfo(rf.term, LeaderFalse, Follower, rf.voteFor)
 		Debugf(dLeader, "S%d not become leader Term %d VoteCount %d",
-			rf.me, rf.term, voteCount)
+			rf.me, term, voteCount)
 	}
 	// update heart beat time anyway
 	rf.updateHeartBeatTime()
@@ -434,7 +468,7 @@ func (rf *Raft) leaderSendAppendEntry() {
 	}
 	cond.L.Lock()
 	defer cond.L.Unlock()
-	for heartBeatOKCount < rf.getMajorityCount() && finished < rf.getPeerCount() && rpcFailed < rf.getMajorityCount() {
+	for appendEntryOKCount < rf.getMajorityCount() && finished < rf.getPeerCount() && rpcFailed < rf.getMajorityCount() {
 		cond.Wait()
 	}
 	if heartBeatOKCount >= rf.getMajorityCount() {
@@ -450,14 +484,15 @@ func (rf *Raft) leaderSendAppendEntry() {
 			rf.me, rf.commitedIndex, newCommitedIndex)
 		if rf.commitedIndex < newCommitedIndex && logTerm == rf.term {
 			for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+				Debugf(dCommit, "S%d leader commit at %d term %d command %v",
+					rf.me, i, rf.term, rf.entries[i].Command)
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
 					Command:      rf.entries[i].Command,
 					CommandIndex: rf.entries[i].Index,
 				}
 				rf.entries[i].Committed = true
-				Debugf(dCommit, "S%d leader commit at %d term %d command %v",
-					rf.me, i, rf.term, rf.entries[i].Command)
+				rf.persist()
 			}
 			rf.commitedIndex = newCommitedIndex
 		}
@@ -510,9 +545,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// convert peer to follower state and update heart beat time
 		rf.modifyPeerInfo(args.Term, LeaderFalse, Follower, args.Peer)
 		rf.updateHeartBeatTime()
+		rf.persist()
 	} else if args.Term > rf.term {
 		// update peer state but not update heart beart time
-		rf.modifyPeerInfo(args.Term, LeaderFalse, Follower, None)
+		rf.modifyPeerInfo(args.Term, LeaderFalse, Follower, rf.me)
+		rf.persist()
 	}
 	reply.Peer, reply.Term, reply.VoteFor = rf.me, rf.term, rf.voteFor
 }
@@ -543,6 +580,7 @@ func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 		if rf.matchLog(req.PrevLogIndex, req.PrevLogTerm) {
 			// merge log
 			rf.mergeLog(req.PrevLogIndex, req.Entries)
+			rf.persist()
 			li, _ := rf.getLastEntryInfo()
 			newCommitedIndex := getMin(li, req.CommitedIndex)
 			Debugf(dCommit, "S%d follower commitIndex %d newCommitedIndex %d",
@@ -550,14 +588,15 @@ func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 			if rf.commitedIndex < newCommitedIndex {
 				// apply msg
 				for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+					Debugf(dCommit, "S%d follower commit at %d term %d command %v",
+						rf.me, i, rf.term, rf.entries[i].Command)
 					rf.applyCh <- ApplyMsg{
 						CommandValid: true,
 						Command:      rf.entries[i].Command,
 						CommandIndex: rf.entries[i].Index,
 					}
 					rf.entries[i].Committed = true
-					Debugf(dCommit, "S%d follower commit at %d term %d command %v",
-						rf.me, i, rf.term, rf.entries[i].Command)
+					rf.persist()
 				}
 				rf.commitedIndex = newCommitedIndex
 			}
@@ -608,11 +647,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryRequest, reply *AppendEntryResponse) bool {
 	start := time.Now()
 	logId := rand.Uint64()
-	Debugf(dLog, "S%d send[%d] append entry to S%d req %v",
-		rf.me, logId, server, *args)
+	Debugf(dLog, "S%d send[%d] append entry to S%d req logs %s",
+		rf.me, logId, server, entriesStr(args.Entries))
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
-	Debugf(dLog, "S%d send[%d] append entry to S%d req %v rpc %t time %d",
-		rf.me, logId, server, *args, ok, time.Since(start)/time.Millisecond)
+	Debugf(dLog, "S%d send[%d] append entry to S%d req %s logs rpc %t time %d",
+		rf.me, logId, server, entriesStr(args.Entries), ok, time.Since(start)/time.Millisecond)
 	return ok
 }
 
@@ -648,6 +687,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Committed: false,
 		})
 		rf.nextIndex[rf.me] = index + 1
+		rf.persist()
 	}
 	Debugf(dStart, "S%d start command %v index %d term %d isLeader %t",
 		rf.me, command, index, term, isLeader)
@@ -666,6 +706,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	t, _, _, _ := rf.getPeerInfo()
+	Debugf(dInfo, "S%d Killed term %d", rf.me, t)
 }
 
 func (rf *Raft) killed() bool {
@@ -687,12 +731,22 @@ func (rf *Raft) ticker() {
 		} else if state == Leader {
 			// leader send append entry to followers
 			go rf.leaderSendAppendEntry()
+		} else {
+			// candidater
+			rf.mu.Lock()
+			if rf.candidateTimeout() {
+				rf.modifyPeerInfo(rf.term, LeaderFalse, Follower, rf.me)
+			}
+			rf.mu.Unlock()
 		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		sleepTime := 100 + (rand.Int63() % 350)
+		if isLeader {
+			sleepTime = 100
+		}
+		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 	}
 }
 
@@ -715,9 +769,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	func() {
+		// Your initialization code here (2A, 2B, 2C).
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.modifyPeerInfo(ZeroTerm, false, Follower, None)
+		rf.term, rf.isLeader, rf.state, rf.voteFor = ZeroTerm, LeaderFalse, Follower, None
 		rf.updateHeartBeatTime()
 		rf.entries = make([]*Entry, 0)
 		rf.commitedIndex = ZeroIndex
@@ -725,12 +780,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex = append(rf.nextIndex, ZeroIndex+1)
 		}
+		// initialize from state persisted before a crash
+		// read persisted data if existed
+		rf.readPersist(persister.ReadRaftState())
 	}()
-
-	// Your initialization code here (2A, 2B, 2C).
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

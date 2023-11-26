@@ -35,8 +35,8 @@ import (
 )
 
 const (
-	ZeroIndex        = 0
-	ZeroTerm         = 0
+	InitIndex        = 0
+	InitTerm         = 0
 	None             = -1
 	Follower         = 0
 	Candidater       = 1
@@ -94,6 +94,12 @@ type Entry struct {
 	Committed bool
 }
 
+type Snapshot struct {
+	LastLogIndex int
+	LastLogTerm  int
+	Data         []byte
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -113,9 +119,29 @@ type Raft struct {
 	lastHeartBeatTime time.Time // Last receive heart beat time
 
 	applyCh       chan ApplyMsg
+	innerApplyCh  chan *ApplyMsg
+	done          chan struct{}
+	baseLogIndex  int      // last log index of snapshot
+	baseLogTerm   int      // last log term of snapshot
+	snapshot      Snapshot // raft snapshot
 	entries       []*Entry // Raft logs
 	commitedIndex int      // Leader's commited log index
 	nextIndex     []int    // Next index for followers
+}
+
+// getLogicalLogLen get logcial log length
+func (rf *Raft) getLogicalLogLen() int {
+	return rf.baseLogIndex + len(rf.entries)
+}
+
+// convertToPhysicalIndex convert logical index to physical index
+func (rf *Raft) convertToPhysicalIndex(idx int) int {
+	return idx - rf.baseLogIndex - 1
+}
+
+// convertToLogicalIndex convert physical index to logical index
+func (rf *Raft) convertToLogicalIndex(idx int) int {
+	return idx + rf.baseLogIndex + 1
 }
 
 // getMajorityCount
@@ -163,17 +189,24 @@ func (rf *Raft) modifyPeerInfo(t int, l bool, s, v int) {
 }
 
 // getEntryInfo at idx
-func (rf *Raft) getEntryInfo(idx int) (int, int) {
-	if idx == ZeroIndex {
-		return ZeroIndex, ZeroTerm
+func (rf *Raft) getEntryInfo(idx int) (int, int, bool) {
+	pIndex := rf.convertToPhysicalIndex(idx)
+	if pIndex < -1 || pIndex >= len(rf.entries) {
+		return InitIndex, InitIndex, false
 	}
-	e := rf.entries[idx-1]
-	return e.Index, e.Term
+	// spicailly baseLogIndex's physical index is -1
+	if pIndex == -1 {
+		return rf.baseLogIndex, rf.baseLogTerm, true
+	}
+	// use physical index
+	e := rf.entries[pIndex]
+	return e.Index, e.Term, true
 }
 
 // getLastEntryInfo
 func (rf *Raft) getLastEntryInfo() (int, int) {
-	return rf.getEntryInfo(len(rf.entries))
+	i, t, _ := rf.getEntryInfo(rf.getLogicalLogLen())
+	return i, t
 }
 
 // heartBeatTimeout
@@ -198,16 +231,16 @@ func (rf *Raft) couldVote(req *RequestVoteArgs) bool {
 
 // matchLog
 func (rf *Raft) matchLog(index, term int) bool {
-	if index > len(rf.entries) {
+	if index > rf.getLogicalLogLen() {
 		return false
 	}
-	i, t := rf.getEntryInfo(index)
-	return i == index && t == term
+	i, t, ret := rf.getEntryInfo(index)
+	return i == index && t == term && ret
 }
 
 // mergeLog
 func (rf *Raft) mergeLog(prevLogIndex int, entries []*Entry) {
-	i, j := 0, prevLogIndex
+	i, j := 0, rf.convertToPhysicalIndex(prevLogIndex)+1
 	for j < len(rf.entries) && i < len(entries) {
 		if !rf.matchLog(entries[i].Index, entries[i].Term) {
 			break
@@ -218,28 +251,43 @@ func (rf *Raft) mergeLog(prevLogIndex int, entries []*Entry) {
 	// truncate
 	rf.entries = rf.entries[:j]
 	for ; i < len(entries); i++ {
-		entries[i].Committed = false
-		rf.entries = append(rf.entries, entries[i])
+		rf.entries = append(rf.entries, &Entry{
+			Command:   entries[i].Command,
+			Index:     entries[i].Index,
+			Term:      entries[i].Term,
+			Committed: false,
+		})
 	}
 }
 
 // getEntryInfoAux
-func getEntryInfoAux(entries []*Entry, idx int) (int, int) {
-	if idx == ZeroIndex {
-		return ZeroIndex, ZeroTerm
+func getEntryInfoAux(me, bIndex, bTerm int, entries []*Entry, idx int) (int, int) {
+	Debugf(dInfo, "S%d getEntryInfoAux bIndex %d bTerm %d len %d idx %d",
+		me, bIndex, bTerm, len(entries), idx)
+	pIndex := idx - bIndex - 1
+	if pIndex == -1 {
+		return bIndex, bTerm
 	}
-	e := entries[idx-1]
+	e := entries[pIndex]
 	return e.Index, e.Term
 }
 
 // getSendAppendEntryInfo
-func (rf *Raft) getSendAppendEntryInfo(nextIndex int, entries []*Entry) (int, int, []*Entry) {
-	idx, term := getEntryInfoAux(entries, nextIndex-1)
+func (rf *Raft) getSendAppendEntryInfo(me, bIndex, bTerm, nextIndex int, entries []*Entry) (int, int, []*Entry) {
+	idx, term := getEntryInfoAux(me, bIndex, bTerm, entries, nextIndex-1)
 	logs := make([]*Entry, 0)
-	if nextIndex > ZeroIndex {
-		logs = entries[nextIndex-1:]
+	pNextIndex := nextIndex - bIndex - 1
+	if pNextIndex >= 0 && pNextIndex < len(entries) {
+		logs = entries[pNextIndex:]
 	}
 	return idx, term, logs
+}
+
+// applyEntries
+func (rf *Raft) applyMsgs(msgs []*ApplyMsg) {
+	for _, m := range msgs {
+		rf.innerApplyCh <- m
+	}
 }
 
 // HeartBeatTimeout
@@ -283,10 +331,13 @@ func (rf *Raft) persist() {
 	e.Encode(rf.state)
 	e.Encode(rf.isLeader)
 	e.Encode(rf.voteFor)
+	e.Encode(rf.baseLogIndex)
+	e.Encode(rf.baseLogTerm)
 	e.Encode(rf.entries)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
-	Debugf(dInfo, "S%d persist data term %d entries %s", rf.me, rf.term, entriesStr(rf.entries))
+	rf.persister.Save(raftstate, rf.snapshot.Data)
+	Debugf(dInfo, "S%d persist data term %d snapshot(%d %d) entries %s",
+		rf.me, rf.term, rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm, entriesStr(rf.entries))
 }
 
 // restore previously persisted state.
@@ -301,13 +352,19 @@ func (rf *Raft) readPersist(data []byte) {
 	var term, state, voteFor int
 	var isLeader bool
 	var entries []*Entry
+	var lastLogIndex, lastLogTerm int
 	if d.Decode(&term) != nil || d.Decode(&state) != nil || d.Decode(&isLeader) != nil ||
-		d.Decode(&voteFor) != nil || d.Decode(&entries) != nil {
+		d.Decode(&voteFor) != nil || d.Decode(&lastLogIndex) != nil ||
+		d.Decode(&lastLogTerm) != nil || d.Decode(&entries) != nil {
 		Debugf(dError, "S%d readPersist error", rf.me)
 	} else {
 		rf.term, rf.state, rf.isLeader, rf.voteFor = term, state, isLeader, voteFor
+		rf.baseLogIndex = lastLogIndex
+		rf.baseLogTerm = lastLogTerm
 		rf.entries = entries
-		rf.commitedIndex = 0
+		rf.commitedIndex = rf.baseLogIndex
+		rf.snapshot.LastLogIndex = lastLogIndex
+		rf.snapshot.LastLogTerm = lastLogTerm
 		lastIndex := 0
 		for _, e := range rf.entries {
 			if e.Committed {
@@ -321,7 +378,7 @@ func (rf *Raft) readPersist(data []byte) {
 				rf.nextIndex[i] = lastIndex + 1
 				continue
 			}
-			rf.nextIndex[i] = ZeroIndex + 1
+			rf.nextIndex[i] = InitIndex + 1
 		}
 		Debugf(dInfo, "S%d readPersist term %d entries %s", rf.me, rf.term, entriesStr(rf.entries))
 	}
@@ -333,6 +390,24 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debugf(dSnap, "S%d Snapshot idx %d rf.Snapshot(%d, %d)",
+		rf.me, index, rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm)
+	if index <= rf.snapshot.LastLogIndex {
+		return
+	}
+	rf.snapshot.LastLogIndex = index
+	rf.snapshot.Data = snapshot
+	pIndex := rf.convertToPhysicalIndex(index)
+	if pIndex >= 0 && pIndex < len(rf.entries) {
+		// discard leader's log
+		rf.snapshot.LastLogTerm = rf.entries[pIndex].Term
+		rf.entries = rf.entries[pIndex+1:]
+	}
+	rf.baseLogIndex, rf.baseLogTerm = rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm
+	rf.applyAll()
+	rf.persist()
 }
 
 // Start a leader election if need
@@ -420,6 +495,9 @@ func (rf *Raft) leaderSendAppendEntry() {
 	lastLogIndex, _ := rf.getLastEntryInfo()
 	nextIndex[rf.me] = lastLogIndex + 1
 	committedIndex := rf.commitedIndex
+	baseLogIndex := rf.baseLogIndex
+	baseLogTerm := rf.baseLogTerm
+	snapshotData := rf.snapshot.Data
 	rf.mu.Unlock()
 
 	// start send append entry to peers
@@ -434,16 +512,46 @@ func (rf *Raft) leaderSendAppendEntry() {
 		}
 		go func(peer int) {
 			nIdx := nextIndex[peer]
-			prevLogIndex, prevLogTerm, logs := rf.getSendAppendEntryInfo(nIdx, entries)
-			req := AppendEntryRequest{
-				PeerInfo:      PeerInfo{Peer: rf.me, Term: term},
-				PrevLogIndex:  prevLogIndex,
-				PrevLogTerm:   prevLogTerm,
-				Entries:       logs,
-				CommitedIndex: committedIndex,
+			var ok, rspSucc bool          // rpc result, AppendEntry or InstallSnapshot succ
+			var rspTerm, newNextIndex int // term of rpc response, new nextIndex of peer
+			Debugf(dInfo, "S%d AppendEntry to S%d baseLogIndex %d nIdx %d",
+				rf.me, peer, baseLogIndex, nextIndex[peer])
+			if nIdx > baseLogIndex {
+				// AppendEntry
+				prevLogIndex, prevLogTerm, logs := rf.getSendAppendEntryInfo(rf.me, baseLogIndex, baseLogTerm, nIdx, entries)
+				req := AppendEntryRequest{
+					PeerInfo:      PeerInfo{Peer: rf.me, Term: term},
+					PrevLogIndex:  prevLogIndex,
+					PrevLogTerm:   prevLogTerm,
+					Entries:       logs,
+					CommitedIndex: committedIndex,
+				}
+				rsp := AppendEntryResponse{}
+				ok = rf.sendAppendEntry(peer, &req, &rsp)
+				rspTerm, rspSucc = rsp.Term, rsp.Succ
+				if rspSucc {
+					newNextIndex = prevLogIndex + len(req.Entries) + 1
+				} else {
+					newNextIndex = InitIndex + 1
+				}
+			} else {
+				// InstallSnapshot
+				req := InstallSnapshotRequest{
+					PeerInfo:     PeerInfo{Peer: rf.me, Term: term},
+					LastLogIndex: baseLogIndex,
+					LastLogTerm:  baseLogTerm,
+					Data:         snapshotData,
+				}
+				rsp := InstallSnapshotResponse{}
+				ok = rf.sendInstallSnapshot(peer, &req, &rsp)
+				rspTerm, rspSucc = rsp.Term, rsp.Succ
+				if rspSucc {
+					newNextIndex = baseLogIndex + 1
+					Debugf(dInfo, "S%d newIndex %d", peer, newNextIndex)
+				} else {
+					newNextIndex = baseLogIndex - 1
+				}
 			}
-			rsp := AppendEntryResponse{}
-			ok := rf.sendAppendEntry(peer, &req, &rsp)
 			cond.L.Lock()
 			defer cond.L.Unlock()
 			finished++
@@ -452,15 +560,12 @@ func (rf *Raft) leaderSendAppendEntry() {
 				cond.Broadcast()
 				return
 			}
-			if term == rsp.Term {
+			if term == rspTerm {
 				heartBeatOKCount++
-				if rsp.Succ {
+				nextIndex[peer] = newNextIndex
+				rf.nextIndex[peer] = nextIndex[peer]
+				if rspSucc {
 					appendEntryOKCount++
-					nextIndex[peer] = prevLogIndex + len(req.Entries) + 1
-					rf.nextIndex[peer] = prevLogIndex + len(req.Entries) + 1
-				} else {
-					nextIndex[peer] = ZeroIndex + 1
-					rf.nextIndex[peer] = ZeroIndex + 1
 				}
 			}
 			cond.Broadcast()
@@ -479,22 +584,24 @@ func (rf *Raft) leaderSendAppendEntry() {
 		tmpIndex := make([]int, len(nextIndex))
 		copy(tmpIndex, nextIndex)
 		newCommitedIndex := rf.getMajorityIndex(tmpIndex)
-		_, logTerm := rf.getEntryInfo(newCommitedIndex)
+		_, logTerm, ret := rf.getEntryInfo(newCommitedIndex)
 		Debugf(dCommit, "S%d leader commitIndex %d newCommitedIndex %d",
 			rf.me, rf.commitedIndex, newCommitedIndex)
-		if rf.commitedIndex < newCommitedIndex && logTerm == rf.term {
-			for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+		if rf.commitedIndex < newCommitedIndex && logTerm == rf.term && ret {
+			msgs := make([]*ApplyMsg, 0)
+			for i := rf.convertToPhysicalIndex(rf.commitedIndex) + 1; i <= rf.convertToPhysicalIndex(newCommitedIndex); i++ {
 				Debugf(dCommit, "S%d leader commit at %d term %d command %v",
-					rf.me, i, rf.term, rf.entries[i].Command)
-				rf.applyCh <- ApplyMsg{
+					rf.me, rf.convertToLogicalIndex(i), rf.term, rf.entries[i].Command)
+				msgs = append(msgs, &ApplyMsg{
 					CommandValid: true,
 					Command:      rf.entries[i].Command,
 					CommandIndex: rf.entries[i].Index,
-				}
+				})
 				rf.entries[i].Committed = true
-				rf.persist()
 			}
+			rf.applyMsgs(msgs)
 			rf.commitedIndex = newCommitedIndex
+			rf.persist()
 		}
 	}
 	if rf.heartBeatTimeout() {
@@ -503,6 +610,29 @@ func (rf *Raft) leaderSendAppendEntry() {
 			rf.me, heartBeatOKCount, finished, rpcFailed)
 		rf.modifyPeerInfo(rf.term, LeaderFalse, Follower, rf.voteFor)
 	}
+}
+
+func (rf *Raft) applyAll() {
+	msgs := make([]*ApplyMsg, 0)
+	if rf.snapshot.Data != nil && len(rf.snapshot.Data) > 0 {
+		msgs = append(msgs, &ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			SnapshotIndex: rf.snapshot.LastLogIndex,
+			SnapshotTerm:  rf.snapshot.LastLogTerm,
+			Snapshot:      rf.snapshot.Data,
+		})
+	}
+	for _, e := range rf.entries {
+		if e.Committed {
+			msgs = append(msgs, &ApplyMsg{
+				CommandValid: true,
+				CommandIndex: e.Index,
+				Command:      e.Command,
+			})
+		}
+	}
+	rf.applyMsgs(msgs)
 }
 
 // PeerInfo record raft term and peer
@@ -575,7 +705,8 @@ func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 	if req.Term >= rf.term {
 		rf.modifyPeerInfo(req.Term, LeaderFalse, Follower, req.Peer)
 		rf.updateHeartBeatTime()
-		Debugf(dLog2, "S%d follower entries %s", rf.me, entriesStr(rf.entries))
+		Debugf(dLog2, "S%d follower logBaseIndex %d entries %s",
+			rf.me, rf.baseLogIndex, entriesStr(rf.entries))
 		// check prev log entry, if match then merge entries sent from leader
 		if rf.matchLog(req.PrevLogIndex, req.PrevLogTerm) {
 			// merge log
@@ -587,21 +718,78 @@ func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 				rf.me, rf.commitedIndex, newCommitedIndex)
 			if rf.commitedIndex < newCommitedIndex {
 				// apply msg
-				for i := rf.commitedIndex; i < newCommitedIndex; i++ {
+				msgs := make([]*ApplyMsg, 0)
+				for i := rf.convertToPhysicalIndex(rf.commitedIndex) + 1; i <= rf.convertToPhysicalIndex(newCommitedIndex); i++ {
 					Debugf(dCommit, "S%d follower commit at %d term %d command %v",
-						rf.me, i, rf.term, rf.entries[i].Command)
-					rf.applyCh <- ApplyMsg{
+						rf.me, rf.convertToLogicalIndex(i), rf.term, rf.entries[i].Command)
+					msgs = append(msgs, &ApplyMsg{
 						CommandValid: true,
 						Command:      rf.entries[i].Command,
 						CommandIndex: rf.entries[i].Index,
-					}
+					})
 					rf.entries[i].Committed = true
-					rf.persist()
 				}
+				rf.applyMsgs(msgs)
 				rf.commitedIndex = newCommitedIndex
+				rf.persist()
 			}
 			rsp.Succ = true
 		}
+	}
+	rsp.Peer, rsp.Term = rf.me, rf.term
+}
+
+type InstallSnapshotRequest struct {
+	// 2D
+	PeerInfo
+	LastLogIndex int
+	LastLogTerm  int
+	Data         []byte
+}
+
+type InstallSnapshotResponse struct {
+	PeerInfo
+	Succ bool
+}
+
+func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, rsp *InstallSnapshotResponse) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if req.Term >= rf.term {
+		rf.modifyPeerInfo(req.Term, LeaderFalse, Follower, req.Peer)
+		rf.updateHeartBeatTime()
+		Debugf(dSnap, "S%d receive snapshot from S%d req[%d %d] rf[%d %d]",
+			rf.me, req.Peer, req.LastLogIndex, req.LastLogTerm, rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm)
+		if req.LastLogIndex >= rf.snapshot.LastLogIndex {
+			rsp.Succ = true
+		}
+		if req.LastLogIndex > rf.snapshot.LastLogIndex {
+			// 1.update snapshot
+			rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm = req.LastLogIndex, req.LastLogTerm
+			rf.snapshot.Data = req.Data
+			rf.baseLogIndex, rf.baseLogTerm = req.LastLogIndex, req.LastLogTerm
+			// 2.truncate log
+			pIndex := rf.convertToPhysicalIndex(req.LastLogIndex)
+			if pIndex >= 0 && pIndex < len(rf.entries) {
+				rf.entries = rf.entries[pIndex+1:]
+			}
+			if req.LastLogIndex > rf.commitedIndex {
+				rf.commitedIndex = getMax(rf.commitedIndex, req.LastLogIndex)
+				msgs := []*ApplyMsg{
+					{
+						CommandValid:  false,
+						SnapshotValid: true,
+						SnapshotIndex: rf.snapshot.LastLogIndex,
+						SnapshotTerm:  rf.snapshot.LastLogTerm,
+						Snapshot:      rf.snapshot.Data,
+					},
+				}
+				Debugf(dCommit, "S%d follower commit snapshot at %d %d",
+					rf.me, rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm)
+				rf.applyMsgs(msgs)
+			}
+		}
+		rf.persist()
 	}
 	rsp.Peer, rsp.Term = rf.me, rf.term
 }
@@ -652,6 +840,17 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryRequest, reply *App
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	Debugf(dLog, "S%d send[%d] append entry to S%d req %s logs rpc %t time %d",
 		rf.me, logId, server, entriesStr(args.Entries), ok, time.Since(start)/time.Millisecond)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, req *InstallSnapshotRequest, rsp *InstallSnapshotResponse) bool {
+	start := time.Now()
+	logId := rand.Uint64()
+	Debugf(dLog, "S%d send[%d] install snapshot to S%d sIdx %d sTerm %d",
+		rf.me, logId, server, req.LastLogIndex, req.LastLogTerm)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", req, rsp)
+	Debugf(dLog, "S%d send[%d] install snapshot to S%d sIdx %d sTerm %d rpc %t time %d",
+		rf.me, logId, server, req.LastLogIndex, req.LastLogTerm, ok, time.Since(start)/time.Millisecond)
 	return ok
 }
 
@@ -710,11 +909,23 @@ func (rf *Raft) Kill() {
 	defer rf.mu.Unlock()
 	t, _, _, _ := rf.getPeerInfo()
 	Debugf(dInfo, "S%d Killed term %d", rf.me, t)
+	rf.done <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) applier() {
+	for {
+		select {
+		case m := <-rf.innerApplyCh:
+			rf.applyCh <- *m
+		case <-rf.done:
+			return
+		}
+	}
 }
 
 func (rf *Raft) ticker() {
@@ -767,26 +978,36 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
+	rf.innerApplyCh = make(chan *ApplyMsg, 10000)
+	rf.done = make(chan struct{})
 
 	func() {
 		// Your initialization code here (2A, 2B, 2C).
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.term, rf.isLeader, rf.state, rf.voteFor = ZeroTerm, LeaderFalse, Follower, None
+		rf.term, rf.isLeader, rf.state, rf.voteFor = InitTerm, LeaderFalse, Follower, None
 		rf.updateHeartBeatTime()
+		rf.baseLogIndex = InitIndex
+		rf.baseLogTerm = InitTerm
+		rf.snapshot.Data = make([]byte, 0)
 		rf.entries = make([]*Entry, 0)
-		rf.commitedIndex = ZeroIndex
+		rf.commitedIndex = InitIndex
 		rf.nextIndex = make([]int, 0)
 		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex = append(rf.nextIndex, ZeroIndex+1)
+			rf.nextIndex = append(rf.nextIndex, InitIndex+1)
 		}
 		// initialize from state persisted before a crash
 		// read persisted data if existed
 		rf.readPersist(persister.ReadRaftState())
+		rf.snapshot.Data = persister.ReadSnapshot()
+		// apply all msg
+		rf.applyAll()
 	}()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	// start appplier goroutine to apply msg
+	go rf.applier()
 
 	return rf
 }

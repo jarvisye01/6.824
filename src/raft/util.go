@@ -50,7 +50,7 @@ func init() {
 }
 
 func getVerbosity() int {
-	v := os.Getenv("VERBOSE")
+	v := os.Getenv("RAFT_VERBOSE")
 	level := 0
 	if v != "" {
 		var err error

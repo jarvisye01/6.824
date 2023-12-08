@@ -739,8 +739,8 @@ func (rf *Raft) AppendEntry(req *AppendEntryRequest, rsp *AppendEntryResponse) {
 						rf.entries[i].Committed = true
 					}
 					rf.commitedIndex = newCommitedIndex
-					rf.applyMsgs(msgs)
 					rf.persist()
+					rf.applyMsgs(msgs)
 				}
 				rsp.Succ = true
 			}
@@ -774,12 +774,15 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, rsp *InstallSnapsho
 			rsp.Succ = true
 		}
 		if req.LastLogIndex > rf.snapshot.LastLogIndex {
-			// 1.update snapshot
+			// 1.get physical index of req.LastLogIndex
+			pIndex := rf.convertToPhysicalIndex(req.LastLogIndex)
+			// 2.update snapshot
 			rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm = req.LastLogIndex, req.LastLogTerm
 			rf.snapshot.Data = req.Data
 			rf.baseLogIndex, rf.baseLogTerm = req.LastLogIndex, req.LastLogTerm
-			// 2.truncate log
-			pIndex := rf.convertToPhysicalIndex(req.LastLogIndex)
+			// 3.truncate log
+			Debugf(dSnap, "S%d pIndex %d rf.baseLogIndex %d entries %s",
+				rf.me, pIndex, rf.baseLogIndex, entriesStr(rf.entries))
 			if pIndex >= 0 && pIndex < len(rf.entries) {
 				rf.entries = rf.entries[pIndex+1:]
 			} else {
@@ -787,10 +790,10 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, rsp *InstallSnapsho
 			}
 			if req.LastLogIndex > rf.commitedIndex {
 				rf.commitedIndex = getMax(rf.commitedIndex, req.LastLogIndex)
-				rf.applyAll()
 			}
+			rf.persist()
+			rf.applyAll()
 		}
-		rf.persist()
 	}
 	rsp.Peer, rsp.Term = rf.me, rf.term
 }

@@ -46,3 +46,7 @@ Log Compaction个人认为其实并不复杂，但是有几个地方可能会困
 
 - Clerk：client的Get/PutAppend操作一定要在成功之后返回，确保操作成功，也就是说RPC可能失败，但是需要一直重试，直到成功；
 - Sequence Number：每一个操作都要携带一个唯一的Seq，每一个Client的Seq都是单调递增的，这是为了后续可以处理重复操作，这里的主要手段是记录每个Client上一次操作的Seq，如果再次遇到这个Seq的Msg，则需要忽略，只有当NewSeq=LatestSeq+1时才能安全执行操作；
+
+## Raft KV(with snapshot)
+
+如果完成了2D和3A，证明你已经基本理解了Raft的基础理论和状态机的线性特征，3D就很容易完成，即使有Bug应该也能很快就有思路。

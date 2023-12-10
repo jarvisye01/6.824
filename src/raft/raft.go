@@ -319,6 +319,11 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+// GetRaftStateSize get raft log size
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -369,6 +374,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitedIndex = rf.baseLogIndex
 		rf.snapshot.LastLogIndex = lastLogIndex
 		rf.snapshot.LastLogTerm = lastLogTerm
+		rf.snapshot.Data = rf.persister.ReadRaftState()
 		lastIndex := 0
 		for _, e := range rf.entries {
 			if e.Committed {
@@ -396,8 +402,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debugf(dSnap, "S%d Snapshot idx %d rf.Snapshot(%d, %d)",
-		rf.me, index, rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm)
+	Debugf(dSnap, "S%d Snapshot idx %d len %d rf.Snapshot(%d, %d)",
+		rf.me, index, len(snapshot), rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm)
 	if index <= rf.snapshot.LastLogIndex || rf.killed() {
 		return
 	}
@@ -554,6 +560,10 @@ func (rf *Raft) leaderSendAppendEntry() {
 					Debugf(dInfo, "S%d newIndex %d", peer, newNextIndex)
 				} else {
 					newNextIndex = baseLogIndex - 1
+					// avoid deadlock
+					if rf.matchLog(rsp.SnapshotIndex, rsp.SnapshotTerm) {
+						newNextIndex = rsp.SnapshotIndex + 1
+					}
 				}
 			}
 			cond.L.Lock()
@@ -759,7 +769,9 @@ type InstallSnapshotRequest struct {
 
 type InstallSnapshotResponse struct {
 	PeerInfo
-	Succ bool
+	Succ          bool
+	SnapshotIndex int
+	SnapshotTerm  int
 }
 
 func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, rsp *InstallSnapshotResponse) {
@@ -795,7 +807,8 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, rsp *InstallSnapsho
 			rf.applyAll()
 		}
 	}
-	rsp.Peer, rsp.Term = rf.me, rf.term
+	rsp.Peer, rsp.Term, rsp.SnapshotIndex, rsp.SnapshotTerm = rf.me, rf.term,
+		rf.snapshot.LastLogIndex, rf.snapshot.LastLogTerm
 }
 
 // example code to send a RequestVote RPC to a server.

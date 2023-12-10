@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	lastApplyIndex          int
 	clientLastestRequestMap map[int64]ClientLatestResponse // latest client request result
 	kvStore                 map[string]string              // store key and value
 	clientCommandChannel    chan *ClientCommand            // client request channel
@@ -235,8 +237,12 @@ func (kv *KVServer) fastFail(cliCmd *ClientCommand, err error) {
 
 // doApply  process msg from Raft
 func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
+	// fmt.Printf("Server%d doApply start\n", kv.me)
+	// defer fmt.Printf("Server%d doApply end\n", kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	Debugf(dInfo, "Server%d doApply msg CommandValid %t SnapshotValid %t",
+		kv.me, msg.CommandValid, msg.SnapshotValid)
 	if msg.CommandValid {
 		op := msg.Command.(Op)
 		cliKey := kv.encodeKey(op.Seq, op.CliNo)
@@ -300,7 +306,6 @@ func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
 				}
 			}
 		}
-
 		// clear some request if not EmptyCmd
 		needDelKey := make([]string, 0)
 		for k, cliCmd := range kv.waitApplyMsgCommandMap {
@@ -318,6 +323,20 @@ func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
 			if cliCmd != nil {
 				kv.fastFail(cliCmd, fmt.Errorf("Apply newer index/term"))
 			}
+		}
+		kv.lastApplyIndex = msg.CommandIndex
+		kv.makeSnapshot(false)
+	} else if msg.SnapshotValid {
+		Debugf(dServer, "Server%d receive snapshot msg %+v", kv.me, *msg)
+		if msg.Snapshot != nil {
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := labgob.NewDecoder(r)
+			kv.lastApplyIndex = 0
+			kv.kvStore = make(map[string]string, 0)
+			kv.clientLastestRequestMap = make(map[int64]ClientLatestResponse, 0)
+			d.Decode(&kv.lastApplyIndex)
+			d.Decode(&kv.kvStore)
+			d.Decode(&kv.clientLastestRequestMap)
 		}
 	}
 }
@@ -355,24 +374,24 @@ func (kv *KVServer) processClientCommand() {
 
 // readApplyMsg read apply msg from applyCh
 func (kv *KVServer) readApplyMsg() {
-	tiker := time.NewTicker(time.Duration(500) * time.Millisecond)
-	defer tiker.Stop()
+	ticker := time.NewTicker(time.Duration(500) * time.Millisecond)
+	defer ticker.Stop()
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
 			kv.doApply(&msg)
-		case <-tiker.C:
+		case <-ticker.C:
 		}
 	}
 }
 
 // startEmptyOp send an empty message to leader, so leader could commit command message
 func (kv *KVServer) startEmptyOp() {
-	tiker := time.NewTicker(time.Duration(500) * time.Millisecond)
-	defer tiker.Stop()
+	ticker := time.NewTicker(time.Duration(500) * time.Millisecond)
+	defer ticker.Stop()
 	for !kv.killed() {
 		select {
-		case <-tiker.C:
+		case <-ticker.C:
 			kv.mu.Lock()
 			// if server is leader, send an empty op
 			if _, isLeader := kv.rf.GetState(); isLeader && !kv.killed() {
@@ -380,6 +399,39 @@ func (kv *KVServer) startEmptyOp() {
 					Op: EmptyCmd,
 				})
 			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+// makeSnapshot
+func (kv *KVServer) makeSnapshot(force bool) {
+	Debugf(dInfo, "Server%d start make snapshot monitor", kv.me)
+	defer Debugf(dInfo, "Server%d end make snapshot monitor", kv.me)
+	if force || kv.rf.GetRaftStateSize() > kv.maxraftstate {
+		Debugf(dServer, "Server%d make snapshot index %d",
+			kv.me, kv.lastApplyIndex)
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.lastApplyIndex)
+		e.Encode(kv.kvStore)
+		e.Encode(kv.clientLastestRequestMap)
+		snapshot := w.Bytes()
+		Debugf(dInfo, "Server%d make snapshot size %d",
+			kv.me, len(snapshot))
+		kv.rf.Snapshot(kv.lastApplyIndex, snapshot)
+	}
+}
+
+// snapshoter
+func (kv *KVServer) snapshoter() {
+	ticker := time.NewTicker(time.Duration(1) * time.Second)
+	defer ticker.Stop()
+	for !kv.killed() {
+		select {
+		case <-ticker.C:
+			kv.mu.Lock()
+			kv.makeSnapshot(true)
 			kv.mu.Unlock()
 		}
 	}
@@ -410,6 +462,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.lastApplyIndex = 0
 	kv.clientLastestRequestMap = make(map[int64]ClientLatestResponse)
 	kv.kvStore = make(map[string]string)
 	kv.clientCommandChannel = make(chan *ClientCommand, 1000)
@@ -417,5 +470,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go kv.processClientCommand()
 	go kv.readApplyMsg()
 	go kv.startEmptyOp()
+	go kv.snapshoter()
 	return kv
 }

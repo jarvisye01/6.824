@@ -406,6 +406,9 @@ func (kv *KVServer) startEmptyOp() {
 
 // makeSnapshot
 func (kv *KVServer) makeSnapshot(force bool) {
+	if kv.maxraftstate == -1 {
+		return
+	}
 	Debugf(dInfo, "Server%d start make snapshot monitor", kv.me)
 	defer Debugf(dInfo, "Server%d end make snapshot monitor", kv.me)
 	if force || kv.rf.GetRaftStateSize() > kv.maxraftstate {

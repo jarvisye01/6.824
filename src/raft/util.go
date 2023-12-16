@@ -36,11 +36,12 @@ var (
 )
 
 const (
-	TraceLevel = 0
-	DebugLevel = 1
-	WarnLevel  = 2
-	InfoLevel  = 3
-	ErrorLevel = 4
+	TraceLevel = 5
+	DebugLevel = 4
+	WarnLevel  = 3
+	InfoLevel  = 2
+	ErrorLevel = 1
+	EmptyLevel = 0
 )
 
 func init() {
@@ -51,7 +52,7 @@ func init() {
 
 func getVerbosity() int {
 	v := os.Getenv("RAFT_VERBOSE")
-	level := 0
+	level := EmptyLevel
 	if v != "" {
 		var err error
 		level, err = strconv.Atoi(v)
@@ -71,25 +72,25 @@ func logf(t logTopic, format string, v ...interface{}) {
 }
 
 func Tracef(t logTopic, format string, v ...interface{}) {
-	if logVerbosity <= TraceLevel {
+	if logVerbosity >= TraceLevel {
 		logf(t, format, v...)
 	}
 }
 
 func Debugf(t logTopic, format string, v ...interface{}) {
-	if logVerbosity <= DebugLevel {
+	if logVerbosity >= DebugLevel {
 		logf(t, format, v...)
 	}
 }
 
 func Warnf(t logTopic, format string, v ...interface{}) {
-	if logVerbosity <= WarnLevel {
+	if logVerbosity >= WarnLevel {
 		logf(t, format, v...)
 	}
 }
 
 func Infof(t logTopic, format string, v ...interface{}) {
-	if logVerbosity <= InfoLevel {
+	if logVerbosity >= InfoLevel {
 		logf(t, format, v...)
 	}
 }

@@ -17,8 +17,25 @@ package shardctrler
 // You will need to add fields to the RPC argument structs.
 //
 
+// shard controller options
+const (
+	JoinCmd  = "Join"
+	QueryCmd = "Query"
+	LeaveCmd = "Leave"
+	MoveCmd  = "Move"
+	EmptyCmd = "Empty"
+)
+
 // The number of shards.
 const NShards = 10
+
+const (
+	OldMsgError       = "OldMsgError"
+	OldRequestError   = "Old Request Error"
+	NotLeaderError    = "Not Leader Error"
+	RequestExistError = "Request Exists Error"
+	ConfigNumError    = "Config Num Error"
+)
 
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
@@ -34,7 +51,14 @@ const (
 
 type Err string
 
+// ClientInfo client info
+type ClientInfo struct {
+	Seq      int
+	ClientNo int64
+}
+
 type JoinArgs struct {
+	ClientInfo
 	Servers map[int][]string // new GID -> servers mappings
 }
 
@@ -44,6 +68,7 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
+	ClientInfo
 	GIDs []int
 }
 
@@ -53,6 +78,7 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
+	ClientInfo
 	Shard int
 	GID   int
 }
@@ -63,6 +89,7 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
+	ClientInfo
 	Num int // desired config number
 }
 

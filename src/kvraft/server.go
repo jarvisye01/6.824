@@ -61,7 +61,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	lastApplyIndex          int
-	clientLastestRequestMap map[int64]ClientLatestResponse // latest client request result
+	clientLatestResponseMap map[int64]ClientLatestResponse // latest client request result
 	kvStore                 map[string]string              // store key and value
 	clientCommandChannel    chan *ClientCommand            // client request channel
 	waitApplyMsgCommandMap  map[string]*ClientCommand      // client wait apply message from raft
@@ -82,8 +82,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 		// check has been processed
-		if val, _ := kv.clientLastestRequestMap[args.CliNo]; args.Seq < val.Seq {
-			Debugf(dError, "Server%d recieve old request seq %s lasted seq %s",
+		if val, _ := kv.clientLatestResponseMap[args.CliNo]; args.Seq < val.Seq {
+			Debugf(dError, "Server%d recieve old request seq %d latest seq %d",
 				kv.me, args.Seq, val.Seq)
 			reply.Err = "Old request"
 			return
@@ -124,8 +124,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 		// check has been processed
-		if val, _ := kv.clientLastestRequestMap[args.CliNo]; args.Seq < val.Seq {
-			Debugf(dError, "Server%d recieve old request seq %s lasted seq %s",
+		if val, _ := kv.clientLatestResponseMap[args.CliNo]; args.Seq < val.Seq {
+			Debugf(dError, "Server%d recieve old request seq %s latest seq %s",
 				kv.me, args.Seq, val.Seq)
 			reply.Err = "Old request"
 			return
@@ -254,7 +254,7 @@ func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
 		if op.Op != EmptyCmd {
 			// not empty command
 			updateLatest := false
-			val, _ := kv.clientLastestRequestMap[op.CliNo]
+			val, _ := kv.clientLatestResponseMap[op.CliNo]
 			if op.Seq == val.Seq {
 				// has processed
 				if cliCmd != nil && cliCmd.matchMsg(msg) {
@@ -301,7 +301,7 @@ func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
 			}
 			if updateLatest {
 				// update client's latest request number
-				kv.clientLastestRequestMap[op.CliNo] = ClientLatestResponse{
+				kv.clientLatestResponseMap[op.CliNo] = ClientLatestResponse{
 					Seq: op.Seq,
 				}
 			}
@@ -333,10 +333,10 @@ func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
 			d := labgob.NewDecoder(r)
 			kv.lastApplyIndex = 0
 			kv.kvStore = make(map[string]string, 0)
-			kv.clientLastestRequestMap = make(map[int64]ClientLatestResponse, 0)
+			kv.clientLatestResponseMap = make(map[int64]ClientLatestResponse, 0)
 			d.Decode(&kv.lastApplyIndex)
 			d.Decode(&kv.kvStore)
-			d.Decode(&kv.clientLastestRequestMap)
+			d.Decode(&kv.clientLatestResponseMap)
 		}
 	}
 }
@@ -406,6 +406,9 @@ func (kv *KVServer) startEmptyOp() {
 
 // makeSnapshot
 func (kv *KVServer) makeSnapshot(force bool) {
+	if kv.maxraftstate == -1 {
+		return
+	}
 	Debugf(dInfo, "Server%d start make snapshot monitor", kv.me)
 	defer Debugf(dInfo, "Server%d end make snapshot monitor", kv.me)
 	if force || kv.rf.GetRaftStateSize() > kv.maxraftstate {
@@ -415,7 +418,7 @@ func (kv *KVServer) makeSnapshot(force bool) {
 		e := labgob.NewEncoder(w)
 		e.Encode(kv.lastApplyIndex)
 		e.Encode(kv.kvStore)
-		e.Encode(kv.clientLastestRequestMap)
+		e.Encode(kv.clientLatestResponseMap)
 		snapshot := w.Bytes()
 		Debugf(dInfo, "Server%d make snapshot size %d",
 			kv.me, len(snapshot))
@@ -463,7 +466,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.lastApplyIndex = 0
-	kv.clientLastestRequestMap = make(map[int64]ClientLatestResponse)
+	kv.clientLatestResponseMap = make(map[int64]ClientLatestResponse)
 	kv.kvStore = make(map[string]string)
 	kv.clientCommandChannel = make(chan *ClientCommand, 1000)
 	kv.waitApplyMsgCommandMap = make(map[string]*ClientCommand)

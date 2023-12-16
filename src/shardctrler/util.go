@@ -1,4 +1,4 @@
-package raft
+package shardctrler
 
 import (
 	"fmt"
@@ -12,16 +12,10 @@ type logTopic string
 
 const (
 	dClient  logTopic = "CLNT"
-	dCommit  logTopic = "CMIT"
-	dStart   logTopic = "STRT"
-	dDrop    logTopic = "DROP"
+	dServer  logTopic = "SVER"
 	dError   logTopic = "ERRO"
 	dInfo    logTopic = "INFO"
-	dLeader  logTopic = "LEAD"
-	dLog     logTopic = "LOG1"
-	dLog2    logTopic = "LOG2"
 	dPersist logTopic = "PERS"
-	dSnap    logTopic = "SNAP"
 	dTerm    logTopic = "TERM"
 	dTest    logTopic = "TEST"
 	dTimer   logTopic = "TIMR"
@@ -51,7 +45,7 @@ func init() {
 }
 
 func getVerbosity() int {
-	v := os.Getenv("RAFT_VERBOSE")
+	v := os.Getenv("SHCTL_VERBOSE")
 	level := EmptyLevel
 	if v != "" {
 		var err error

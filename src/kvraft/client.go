@@ -15,7 +15,7 @@ type Clerk struct {
 	leaderServer *labrpc.ClientEnd
 	leaderIndex  int
 	seq          int
-	cliNo        int64 // client nunber
+	cliNo        int64 // client number
 }
 
 func nrand() int64 {

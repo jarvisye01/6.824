@@ -213,7 +213,7 @@ func (kv *KVServer) addToWaitApplyMsgCommandMap(key string, cliCmd *ClientComman
 		kv.me, key, cliCmd, kv.waitApplyMsgCommandMap)
 	_, ok := kv.waitApplyMsgCommandMap[key]
 	if ok {
-		Debugf(dError, "Server%d element exist key %s", key)
+		Debugf(dError, "Server%d element exists key %s", key)
 		return fmt.Errorf("Element Exist %s", key)
 	}
 	kv.waitApplyMsgCommandMap[key] = cliCmd
@@ -237,8 +237,6 @@ func (kv *KVServer) fastFail(cliCmd *ClientCommand, err error) {
 
 // doApply  process msg from Raft
 func (kv *KVServer) doApply(msg *raft.ApplyMsg) {
-	// fmt.Printf("Server%d doApply start\n", kv.me)
-	// defer fmt.Printf("Server%d doApply end\n", kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	Debugf(dInfo, "Server%d doApply msg CommandValid %t SnapshotValid %t",

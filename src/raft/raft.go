@@ -499,7 +499,15 @@ func (rf *Raft) leaderSendAppendEntry() {
 		return
 	}
 	entries := make([]*Entry, 0)
-	entries = append(entries, rf.entries...)
+	for _, e := range rf.entries {
+		ee := &Entry{
+			Command:   e.Command,
+			Index:     e.Index,
+			Term:      e.Term,
+			Committed: e.Committed,
+		}
+		entries = append(entries, ee)
+	}
 	nextIndex := make([]int, 0)
 	nextIndex = append(nextIndex, rf.nextIndex...)
 	lastLogIndex, _ := rf.getLastEntryInfo()

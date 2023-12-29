@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -249,6 +250,7 @@ func (kv *ShardKV) MigrateShards(req *MigrateArgs, rsp *MigrateReply) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (kv *ShardKV) Kill() {
+	Debugf(dServer, "Server_%d_%d Kill", kv.gid, kv.me)
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
@@ -482,32 +484,38 @@ func (kv *ShardKV) processPutAppendCommand(op *Op, cliCmd *ClientCommand,
 }
 
 // migrateShards
-func (kv *ShardKV) migrateShards(cfg *shardctrler.Config, m1 map[int][]int,
-	m2 map[int]map[string]string) {
-	Debugf(dInfo, "Server_%d_%d migrate shards m1 %v m2 %v",
-		kv.gid, kv.me, m1, m2)
+func (kv *ShardKV) migrateShards(cfg *shardctrler.Config, m map[int]map[string]string) {
+	Debugf(dInfo, "Server_%d_%d migrate shards m %v",
+		kv.gid, kv.me, m)
 	wg := sync.WaitGroup{}
-	for gid, shards := range m1 {
-		kv.mu.Lock()
-		ck := kv.getRgClerk(gid)
-		kv.mu.Unlock()
-		m := make(map[int]map[string]string)
-		for _, shard := range shards {
-			m[shard] = make(map[string]string)
-			sm := m2[gid]
-			for k, v := range sm {
-				if key2shard(k) == shard {
-					m[shard][k] = v
-				}
-			}
-		}
+	shards := make([]int, 0)
+	for shard := range m {
+		shards = append(shards, shard)
+	}
+	sort.Sort(sort.IntSlice(shards))
+	for _, shard := range shards {
+		m := m[shard]
 		wg.Add(1)
-		go func(gid int) {
+		go func(shard int, m map[string]string) {
 			defer wg.Done()
-			Debugf(dInfo, "Server_%d_%d migrate request %v",
-				kv.gid, kv.me, m)
-			ck.Migrate(gid, cfg.Groups[gid], m)
-		}(gid)
+			var ck *Clerk
+			for {
+				kv.mu.Lock()
+				curConfig := kv.curConfig
+				gid := curConfig.Shards[shard]
+				kv.mu.Unlock()
+				if _, ok := curConfig.Groups[gid]; ok {
+					if ck == nil {
+						kv.mu.Lock()
+						ck = kv.getRgClerk(gid)
+						kv.mu.Unlock()
+					}
+					ck.Migrate(shard, m)
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}(shard, m)
 	}
 	wg.Wait()
 }
@@ -545,21 +553,16 @@ func (kv *ShardKV) processReConfigCommand(op *Op, cliCmd *ClientCommand,
 	}
 	Debugf(dInfo, "Server_%d_%d process reconfig command oldShards %v newShards %v",
 		kv.gid, kv.me, oldShards, newShards)
-	migrateGidShardsMap := make(map[int][]int)
-	migrateGidKeyValueMap := make(map[int]map[string]string)
+	migrateShardKeyValueMap := make(map[int]map[string]string)
 	needClearKeys := make([]string, 0)
 	for _, shard := range oldShards {
 		_, ok := kv.readyShards[shard]
 		// migrate to other replica group
 		if !sliceContainsInt(newShards, shard) && ok {
-			if _, ok := migrateGidShardsMap[r.NewConfig.Shards[shard]]; !ok {
-				migrateGidShardsMap[r.NewConfig.Shards[shard]] = make([]int, 0)
-				migrateGidKeyValueMap[r.NewConfig.Shards[shard]] = make(map[string]string, 0)
+			if _, ok := migrateShardKeyValueMap[shard]; !ok {
+				migrateShardKeyValueMap[shard] = make(map[string]string, 0)
 			}
-			migrateGidShardsMap[r.NewConfig.Shards[shard]] = append(
-				migrateGidShardsMap[r.NewConfig.Shards[shard]], shard,
-			)
-			m := migrateGidKeyValueMap[r.NewConfig.Shards[shard]]
+			m := migrateShardKeyValueMap[shard]
 			for k, v := range kv.kvStore {
 				if key2shard(k) == shard {
 					needClearKeys = append(needClearKeys, k)
@@ -571,7 +574,7 @@ func (kv *ShardKV) processReConfigCommand(op *Op, cliCmd *ClientCommand,
 		}
 	}
 	// migrate
-	go kv.migrateShards(&r.NewConfig, migrateGidShardsMap, migrateGidKeyValueMap)
+	go kv.migrateShards(&r.NewConfig, migrateShardKeyValueMap)
 	// modify curConfig
 	kv.curConfig = r.NewConfig
 	Debugf(dInfo, "Server_%d_%d update config %+v", kv.gid, kv.me, kv.curConfig)
@@ -589,6 +592,14 @@ func (kv *ShardKV) processMigrateCommand(op *Op, cliCmd *ClientCommand,
 	val, _ := kv.clientLatestResponseMap[op.CliNo]
 	Debugf(dInfo, "Server_%d_%d process migrate command client %d op.Seq %d val.Seq %d",
 		kv.gid, kv.me, op.CliNo, op.Seq, val.Seq)
+	r := op.Params.(MigrateArgs)
+	shard := r.Shard
+	if curConfig.Shards[shard] != kv.gid {
+		if cliCmd != nil {
+			kv.fastFail(cliCmd, errors.New(ErrWrongGroup))
+		}
+		return
+	}
 	if op.Seq <= val.Seq {
 		if cliCmd != nil {
 			cliCmd.Done <- struct{}{}
@@ -596,37 +607,13 @@ func (kv *ShardKV) processMigrateCommand(op *Op, cliCmd *ClientCommand,
 		}
 		return
 	}
-	r := op.Params.(MigrateArgs)
-	migrateGidShardsMap := make(map[int][]int)
-	migrateGidKeyValueMap := make(map[int]map[string]string)
-	for shard, m := range r.Shards {
-		if curConfig.Shards[shard] == kv.gid {
-			if _, ok := kv.readyShards[shard]; !ok {
-				// accept shard, then add it to readyShards
-				for k, v := range m {
-					kv.kvStore[k] = v
-				}
-				kv.readyShards[shard] = struct{}{}
-			}
-		} else {
-			// don't accept shard, migrate to another replica group
-			if _, ok := migrateGidShardsMap[curConfig.Shards[shard]]; !ok {
-				migrateGidShardsMap[curConfig.Shards[shard]] = make([]int, 0)
-				migrateGidKeyValueMap[curConfig.Shards[shard]] = make(map[string]string)
-			}
-			migrateGidShardsMap[curConfig.Shards[shard]] = append(
-				migrateGidShardsMap[curConfig.Shards[shard]], shard,
-			)
-			m1 := migrateGidKeyValueMap[curConfig.Shards[shard]]
-			for k, v := range m {
-				m1[k] = v
-			}
-			// delete it in readyShards
-			delete(kv.readyShards, shard)
+	if _, ok := kv.readyShards[shard]; !ok {
+		// accept shard, then add it to readyShards
+		for k, v := range r.M {
+			kv.kvStore[k] = v
 		}
+		kv.readyShards[shard] = struct{}{}
 	}
-	// migrate
-	go kv.migrateShards(curConfig, migrateGidShardsMap, migrateGidKeyValueMap)
 	if cliCmd != nil {
 		cliCmd.Rsp.(*MigrateReply).Err = OK
 		cliCmd.Done <- struct{}{}
@@ -672,8 +659,7 @@ func (kv *ShardKV) scheduleMigrate() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	cfg := &kv.curConfig
-	migrateGidShardsMap := make(map[int][]int)
-	migrateGidKeyValueMap := make(map[int]map[string]string)
+	migrateShardKeyValueMap := make(map[int]map[string]string)
 	needClearKeys := make([]string, 0)
 	for k, v := range kv.kvStore {
 		shard := key2shard(k)
@@ -681,16 +667,10 @@ func (kv *ShardKV) scheduleMigrate() {
 			continue
 		}
 		if cfg.Shards[shard] != kv.gid {
-			if _, ok := migrateGidShardsMap[cfg.Shards[shard]]; !ok {
-				migrateGidShardsMap[cfg.Shards[shard]] = make([]int, 0)
-				migrateGidKeyValueMap[cfg.Shards[shard]] = make(map[string]string)
+			if _, ok := migrateShardKeyValueMap[shard]; !ok {
+				migrateShardKeyValueMap[cfg.Shards[shard]] = make(map[string]string)
 			}
-			if !sliceContainsInt(migrateGidShardsMap[cfg.Shards[shard]], shard) {
-				migrateGidShardsMap[cfg.Shards[shard]] = append(
-					migrateGidShardsMap[cfg.Shards[shard]], shard,
-				)
-			}
-			m1 := migrateGidKeyValueMap[cfg.Shards[shard]]
+			m1 := migrateShardKeyValueMap[shard]
 			m1[k] = v
 			needClearKeys = append(needClearKeys, k)
 		}
@@ -698,7 +678,7 @@ func (kv *ShardKV) scheduleMigrate() {
 	for _, k := range needClearKeys {
 		delete(kv.readyShards, key2shard(k))
 	}
-	go kv.migrateShards(cfg, migrateGidShardsMap, migrateGidKeyValueMap)
+	go kv.migrateShards(cfg, migrateShardKeyValueMap)
 	return
 }
 
@@ -837,9 +817,6 @@ func (kv *ShardKV) configPoller() {
 		select {
 		case <-ticker.C:
 			func() {
-				if _, isLeader := kv.rf.GetState(); !isLeader {
-					return
-				}
 				newConfig := kv.controllerClerk.Query(-1)
 				Debugf(dInfo, "Server_%d_%d new config %+v", kv.gid, kv.me, newConfig)
 				kv.mu.Lock()
@@ -847,7 +824,11 @@ func (kv *ShardKV) configPoller() {
 				Debugf(dInfo, "Server_%d_%d cur config %+v", kv.gid, kv.me, curConfig)
 				ck := kv.getRgClerk(kv.gid)
 				kv.mu.Unlock()
-				if newConfig.Num > curConfig.Num {
+				_, isLeader := kv.rf.GetState()
+				if !isLeader {
+					Debugf(dInfo, "Server_%d_%d not leader", kv.gid, kv.me)
+				}
+				if newConfig.Num > curConfig.Num && isLeader {
 					// re configuration
 					Debugf(dInfo, "Server_%d_%d new config %+v", kv.gid, kv.me, newConfig)
 					ck.ReConfig(kv.gid, kv.servers, curConfig, newConfig)

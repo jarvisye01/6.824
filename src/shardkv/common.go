@@ -92,8 +92,8 @@ func (r *ReConfigReply) OK() bool {
 // MigrateArgs request for migrate shard
 type MigrateArgs struct {
 	ClientInfo
-	Gid    int                       //dst gid
-	Shards map[int]map[string]string // migrate shards
+	Shard int               // shard
+	M     map[string]string // key/value
 }
 
 // MigrateReply

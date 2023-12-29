@@ -177,7 +177,7 @@ func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
 
-func (ck *Clerk) Migrate(gid int, servers []string, shards map[int]map[string]string) {
+func (ck *Clerk) Migrate(shard int, m map[string]string) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 	req := MigrateArgs{
@@ -185,30 +185,30 @@ func (ck *Clerk) Migrate(gid int, servers []string, shards map[int]map[string]st
 			Seq:      ck.getSeq(),
 			ClientNo: ck.cliNo,
 		},
-		Gid:    gid,
-		Shards: shards,
+		Shard: shard,
+		M:     m,
 	}
 	for {
-		shards := make([]int, 0)
-		for shard := range req.Shards {
-			shards = append(shards, shard)
-		}
-		for si := 0; si < len(servers); si++ {
-			svr := ck.make_end(servers[si])
-			var rsp MigrateReply
-			ok := svr.Call("ShardKV.MigrateShards", &req, &rsp)
-			Debugf(dClient, "Client%d Seq %d Migrate shards to gid %d server[%s]",
-				ck.cliNo, req.Seq, gid, servers[si])
-			if ok && rsp.OK() {
-				Debugf(dClient, "Client%d Seq %d Migrate shards[%v] to gid %d rg %s succ",
-					ck.cliNo, req.Seq, shards, gid, servers[si])
-				return
+		ck.config = ck.sm.Query(-1)
+		gid := ck.config.Shards[shard]
+		if servers, ok := ck.config.Groups[gid]; ok {
+			for si := 0; si < len(servers); si++ {
+				svr := ck.make_end(servers[si])
+				var rsp MigrateReply
+				Debugf(dClient, "Client%d Seq %d Migrate shard %d to gid %d server %s",
+					ck.cliNo, req.Seq, shard, gid, servers[si])
+				ok := svr.Call("ShardKV.MigrateShards", &req, &rsp)
+				if ok && rsp.OK() {
+					Debugf(dClient, "Client%d Seq %d Migrate shard %d to gid %d server %s succ",
+						ck.cliNo, req.Seq, shard, gid, servers[si])
+					return
+				}
+				Debugf(dClient, "Client%d Seq %d Migrate shard %d to gid %d server %s error %s ok %t fail",
+					ck.cliNo, req.Seq, shard, gid, servers[si], rsp.Err, ok)
+				// migrate fail, need retry
 			}
-			Debugf(dClient, "Client%d Seq %d Migrate shards[%v] to gid %d rg %s error %s ok %t fail %d",
-				ck.cliNo, req.Seq, shards, gid, servers[si], rsp.Err, ok, len(servers))
-			// migrate fail, need retry
-			time.Sleep(100 * time.Millisecond)
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -227,7 +227,7 @@ func (ck *Clerk) ReConfig(gid int, servers []*labrpc.ClientEnd, oldConfig, newCo
 		for si := 0; si < len(servers); si++ {
 			svr := servers[si]
 			var rsp ReConfigReply
-			Debugf(dClient, "Client%d Seq %d ReConfig to gid %s server[%s]",
+			Debugf(dClient, "Client%d Seq %d ReConfig to gid %d server[%s]",
 				ck.cliNo, req.Seq, gid, servers[si])
 			ok := svr.Call("ShardKV.ReConfig", &req, &rsp)
 			if ok && rsp.OK() {
@@ -238,7 +238,6 @@ func (ck *Clerk) ReConfig(gid int, servers []*labrpc.ClientEnd, oldConfig, newCo
 			// reconfig fail, need retry
 			Debugf(dClient, "Client%d Seq %d ReConfig to gid %d error %s rg %s ok %t fail",
 				ck.cliNo, req.Seq, gid, rsp.Err, servers[si], ok)
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
